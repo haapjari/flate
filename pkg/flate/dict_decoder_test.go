@@ -137,3 +137,30 @@ func TestDictDecoder(t *testing.T) {
 		t.Errorf("final string mismatch:\ngot  %q\nwant %q", got.String(), want.String())
 	}
 }
+
+func TestDictDecoder_Length65538(t *testing.T) {
+	const copyLength = 65538
+
+	var got bytes.Buffer
+	var dd dictDecoder
+	dd.init(deflate64HistoryWindowSize, nil)
+
+	dd.writeByte('x')
+	for length := copyLength; length > 0; {
+		cnt := dd.tryWriteCopy(1, length)
+		if cnt == 0 {
+			cnt = dd.writeCopy(1, length)
+		}
+
+		length -= cnt
+		if dd.availWrite() == 0 {
+			got.Write(dd.readFlush())
+		}
+	}
+	got.Write(dd.readFlush())
+
+	want := bytes.Repeat([]byte{'x'}, copyLength+1)
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("decoded output mismatch: got %q want %q", got.Bytes(), want)
+	}
+}

@@ -17,12 +17,26 @@ import (
 
 const (
 	maxCodeLen = 16 // max length of Huffman code
-	// The next three numbers come from the RFC section 3.2.7, with the
-	// additional proviso in section 3.2.5 which implies that distance codes
-	// 30 and 31 should never occur in compressed data.
-	maxNumLit  = 286
-	maxNumDist = 30
-	numCodes   = 19 // number of codes in Huffman meta-code
+	// The next constants come from the RFC section 3.2.7. For normal DEFLATE,
+	// the additional proviso in section 3.2.5 implies that distance codes 30 and
+	// 31 should never occur in compressed data.
+	maxNumLit         = 286
+	maxNumDistDeflate = 30
+	// Deflate64 adds distance codes 30 and 31.
+	maxNumDistDeflate64 = 32
+	numCodes            = 19 // number of codes in Huffman meta-code
+
+	maxMatchOffsetDeflate64 = 1 << 16
+
+	deflateHistoryWindowSize   = maxMatchOffset
+	deflate64HistoryWindowSize = maxMatchOffsetDeflate64
+)
+
+type decoderMode uint8
+
+const (
+	decoderModeDeflate decoderMode = iota
+	decoderModeDeflate64
 )
 
 // Initialize the fixedHuffmanDecoder only once upon first use.
@@ -265,6 +279,8 @@ type Reader interface {
 
 // Decompress state.
 type decompressor struct {
+	mode decoderMode
+
 	// Input source.
 	r       Reader
 	rBuf    *bufio.Reader // created if provided io.Reader does not implement io.ByteReader
@@ -278,7 +294,7 @@ type decompressor struct {
 	h1, h2 huffmanDecoder
 
 	// Length arrays used to define Huffman codes.
-	bits     *[maxNumLit + maxNumDist]int
+	bits     *[maxNumLit + maxNumDistDeflate64]int
 	codebits *[numCodes]int
 
 	// Output history, buffer.
@@ -364,28 +380,64 @@ func (f *decompressor) Close() error {
 
 var codeOrder = [...]int{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
 
+func (f *decompressor) distanceSymbolLimit() int {
+	if f.mode == decoderModeDeflate64 {
+		return maxNumDistDeflate64
+	}
+	return maxNumDistDeflate
+}
+
+func (f *decompressor) historyWindowSize() int {
+	if f.mode == decoderModeDeflate64 {
+		return deflate64HistoryWindowSize
+	}
+	return deflateHistoryWindowSize
+}
+
 func (f *decompressor) readHuffman() error {
+	nlit, ndist, nclen, err := f.readHuffmanHeader()
+	if err != nil {
+		return err
+	}
+	if err := f.readCodegenHuffman(nclen); err != nil {
+		return err
+	}
+	if err := f.readHuffmanCodeLengths(nlit, ndist); err != nil {
+		return err
+	}
+	return f.initHuffmanTables(nlit, ndist)
+}
+
+func (f *decompressor) readHuffmanHeader() (
+	nlit int,
+	ndist int,
+	nclen int,
+	err error,
+) {
 	// HLIT[5], HDIST[5], HCLEN[4].
 	for f.nb < 5+5+4 {
 		if err := f.moreBits(); err != nil {
-			return err
+			return 0, 0, 0, err
 		}
 	}
-	nlit := int(f.b&0x1F) + 257
+	nlit = int(f.b&0x1F) + 257
 	if nlit > maxNumLit {
-		return CorruptInputError(f.roffset)
+		return 0, 0, 0, CorruptInputError(f.roffset)
 	}
 	f.b >>= 5
-	ndist := int(f.b&0x1F) + 1
-	if ndist > maxNumDist {
-		return CorruptInputError(f.roffset)
+	ndist = int(f.b&0x1F) + 1
+	if ndist > f.distanceSymbolLimit() {
+		return 0, 0, 0, CorruptInputError(f.roffset)
 	}
 	f.b >>= 5
-	nclen := int(f.b&0xF) + 4
+	nclen = int(f.b&0xF) + 4
 	// numCodes is 19, so nclen is always valid.
 	f.b >>= 4
 	f.nb -= 5 + 5 + 4
+	return nlit, ndist, nclen, nil
+}
 
+func (f *decompressor) readCodegenHuffman(nclen int) error {
 	// (HCLEN+4)*3 bits: code lengths in the magic codeOrder order.
 	for i := 0; i < nclen; i++ {
 		for f.nb < 3 {
@@ -403,7 +455,10 @@ func (f *decompressor) readHuffman() error {
 	if !f.h1.init(f.codebits[0:]) {
 		return CorruptInputError(f.roffset)
 	}
+	return nil
+}
 
+func (f *decompressor) readHuffmanCodeLengths(nlit, ndist int) error {
 	// HLIT + 257 code lengths, HDIST + 1 code lengths,
 	// using the code length Huffman code.
 	for i, n := 0, nlit+ndist; i < n; {
@@ -417,46 +472,63 @@ func (f *decompressor) readHuffman() error {
 			i++
 			continue
 		}
-		// Repeat previous length or zero.
-		var rep int
-		var nb uint
-		var b int
-		switch x {
-		default:
-			return InternalError("unexpected length code")
-		case 16:
-			rep = 3
-			nb = 2
-			if i == 0 {
-				return CorruptInputError(f.roffset)
-			}
-			b = f.bits[i-1]
-		case 17:
-			rep = 3
-			nb = 3
-			b = 0
-		case 18:
-			rep = 11
-			nb = 7
-			b = 0
+
+		next, err := f.readHuffmanRepeat(i, n, x)
+		if err != nil {
+			return err
 		}
-		for f.nb < nb {
-			if err := f.moreBits(); err != nil {
-				return err
-			}
+		i = next
+	}
+	return nil
+}
+
+func (f *decompressor) readHuffmanRepeat(
+	i int,
+	n int,
+	x int,
+) (next int, err error) {
+	// Repeat previous length or zero.
+	var rep int
+	var nb uint
+	var b int
+	switch x {
+	default:
+		return 0, InternalError("unexpected length code")
+	case 16:
+		rep = 3
+		nb = 2
+		if i == 0 {
+			return 0, CorruptInputError(f.roffset)
 		}
-		rep += int(f.b & uint32(1<<nb-1))
-		f.b >>= nb
-		f.nb -= nb
-		if i+rep > n {
-			return CorruptInputError(f.roffset)
-		}
-		for j := 0; j < rep; j++ {
-			f.bits[i] = b
-			i++
+		b = f.bits[i-1]
+	case 17:
+		rep = 3
+		nb = 3
+		b = 0
+	case 18:
+		rep = 11
+		nb = 7
+		b = 0
+	}
+	for f.nb < nb {
+		if err := f.moreBits(); err != nil {
+			return 0, err
 		}
 	}
+	rep += int(f.b & uint32(1<<nb-1))
+	f.b >>= nb
+	f.nb -= nb
+	if i+rep > n {
+		return 0, CorruptInputError(f.roffset)
+	}
+	for range rep {
+		f.bits[i] = b
+		i++
+	}
+	return i, nil
+}
 
+func (f *decompressor) initHuffmanTables(nlit, ndist int) error {
 	if !f.h1.init(f.bits[0:nlit]) || !f.h2.init(f.bits[nlit:nlit+ndist]) {
 		return CorruptInputError(f.roffset)
 	}
@@ -491,132 +563,173 @@ func (f *decompressor) huffmanBlock() {
 
 readLiteral:
 	// Read literal and/or (length, distance) according to RFC section 3.2.3.
-	{
-		v, err := f.huffSym(f.hl)
-		if err != nil {
-			f.err = err
-			return
-		}
-		var n uint // number of bits extra
-		var length int
-		switch {
-		case v < 256:
-			f.dict.writeByte(byte(v))
-			if f.dict.availWrite() == 0 {
-				f.toRead = f.dict.readFlush()
-				f.step = (*decompressor).huffmanBlock
-				f.stepState = stateInit
-				return
-			}
-			goto readLiteral
-		case v == 256:
-			f.finishBlock()
-			return
-		// otherwise, reference to older data
-		case v < 265:
-			length = v - (257 - 3)
-			n = 0
-		case v < 269:
-			length = v*2 - (265*2 - 11)
-			n = 1
-		case v < 273:
-			length = v*4 - (269*4 - 19)
-			n = 2
-		case v < 277:
-			length = v*8 - (273*8 - 35)
-			n = 3
-		case v < 281:
-			length = v*16 - (277*16 - 67)
-			n = 4
-		case v < 285:
-			length = v*32 - (281*32 - 131)
-			n = 5
-		case v < maxNumLit:
-			length = 258
-			n = 0
-		default:
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-		if n > 0 {
-			for f.nb < n {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			length += int(f.b & uint32(1<<n-1))
-			f.b >>= n
-			f.nb -= n
-		}
-
-		var dist int
-		if f.hd == nil {
-			for f.nb < 5 {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			dist = int(bits.Reverse8(uint8(f.b & 0x1F << 3)))
-			f.b >>= 5
-			f.nb -= 5
-		} else {
-			if dist, err = f.huffSym(f.hd); err != nil {
-				f.err = err
-				return
-			}
-		}
-
-		switch {
-		case dist < 4:
-			dist++
-		case dist < maxNumDist:
-			nb := uint(dist-2) >> 1
-			// have 1 bit in bottom of dist, need nb more.
-			extra := (dist & 1) << nb
-			for f.nb < nb {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			extra |= int(f.b & uint32(1<<nb-1))
-			f.b >>= nb
-			f.nb -= nb
-			dist = 1<<(nb+1) + 1 + extra
-		default:
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-
-		// No check on length; encoding can be prescient.
-		if dist > f.dict.histSize() {
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-
-		f.copyLen, f.copyDist = length, dist
-		goto copyHistory
+	if f.readHuffmanLiteral(stateInit) {
+		return
 	}
+	goto copyHistory
 
 copyHistory:
 	// Perform a backwards copy according to RFC section 3.2.3.
-	{
-		cnt := f.dict.tryWriteCopy(f.copyDist, f.copyLen)
-		if cnt == 0 {
-			cnt = f.dict.writeCopy(f.copyDist, f.copyLen)
-		}
-		f.copyLen -= cnt
-
-		if f.dict.availWrite() == 0 || f.copyLen > 0 {
-			f.toRead = f.dict.readFlush()
-			f.step = (*decompressor).huffmanBlock // We need to continue this work
-			f.stepState = stateDict
-			return
-		}
-		goto readLiteral
+	if f.copyHuffmanHistory(stateDict) {
+		return
 	}
+	goto readLiteral
+}
+
+func (f *decompressor) readHuffmanLiteral(stateInit int) bool {
+	for {
+		v, err := f.huffSym(f.hl)
+		if err != nil {
+			f.err = err
+			return true
+		}
+		if v >= 0 && v <= 255 {
+			if f.writeHuffmanLiteralByte(byte(v), stateInit) {
+				return true
+			}
+			continue
+		}
+		if v == 256 {
+			f.finishBlock()
+			return true
+		}
+		return f.readHuffmanMatch(v)
+	}
+}
+
+func (f *decompressor) writeHuffmanLiteralByte(v byte, stateInit int) bool {
+	f.dict.writeByte(v)
+	if f.dict.availWrite() != 0 {
+		return false
+	}
+	f.toRead = f.dict.readFlush()
+	f.step = (*decompressor).huffmanBlock
+	f.stepState = stateInit
+	return true
+}
+
+func (f *decompressor) readHuffmanMatch(v int) bool {
+	length, err := f.huffmanLength(v)
+	if err != nil {
+		f.err = err
+		return true
+	}
+	dist, err := f.huffmanDistance()
+	if err != nil {
+		f.err = err
+		return true
+	}
+	// No check on length; encoding can be prescient.
+	if dist > f.dict.histSize() {
+		f.err = CorruptInputError(f.roffset)
+		return true
+	}
+	f.copyLen, f.copyDist = length, dist
+	return false
+}
+
+func (f *decompressor) huffmanLength(v int) (int, error) {
+	length, n, err := f.huffmanLengthBase(v)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return length, nil
+	}
+	for f.nb < n {
+		if err := f.moreBits(); err != nil {
+			return 0, err
+		}
+	}
+	length += int(f.b & uint32(1<<n-1))
+	f.b >>= n
+	f.nb -= n
+	return length, nil
+}
+
+func (f *decompressor) huffmanLengthBase(
+	v int,
+) (length int, extraBits uint, err error) {
+	switch {
+	case v < 265:
+		return v - (257 - 3), 0, nil
+	case v < 269:
+		return v*2 - (265*2 - 11), 1, nil
+	case v < 273:
+		return v*4 - (269*4 - 19), 2, nil
+	case v < 277:
+		return v*8 - (273*8 - 35), 3, nil
+	case v < 281:
+		return v*16 - (277*16 - 67), 4, nil
+	case v < 285:
+		return v*32 - (281*32 - 131), 5, nil
+	case v == 285 && f.mode == decoderModeDeflate64:
+		return 3, 16, nil
+	case v == 285:
+		return 258, 0, nil
+	default:
+		return 0, 0, CorruptInputError(f.roffset)
+	}
+}
+
+func (f *decompressor) huffmanDistance() (int, error) {
+	dist, err := f.huffmanDistanceSymbol()
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case dist < 4:
+		return dist + 1, nil
+	case dist < f.distanceSymbolLimit():
+		return f.huffmanDistanceFromSymbol(dist)
+	default:
+		return 0, CorruptInputError(f.roffset)
+	}
+}
+
+func (f *decompressor) huffmanDistanceSymbol() (int, error) {
+	if f.hd != nil {
+		return f.huffSym(f.hd)
+	}
+	for f.nb < 5 {
+		if err := f.moreBits(); err != nil {
+			return 0, err
+		}
+	}
+	dist := int(bits.Reverse8(uint8(f.b & 0x1F << 3)))
+	f.b >>= 5
+	f.nb -= 5
+	return dist, nil
+}
+
+func (f *decompressor) huffmanDistanceFromSymbol(dist int) (int, error) {
+	nb := uint(dist-2) >> 1
+	// have 1 bit in bottom of dist, need nb more.
+	extra := (dist & 1) << nb
+	for f.nb < nb {
+		if err := f.moreBits(); err != nil {
+			return 0, err
+		}
+	}
+	extra |= int(f.b & uint32(1<<nb-1))
+	f.b >>= nb
+	f.nb -= nb
+	return 1<<(nb+1) + 1 + extra, nil
+}
+
+func (f *decompressor) copyHuffmanHistory(stateDict int) bool {
+	cnt := f.dict.tryWriteCopy(f.copyDist, f.copyLen)
+	if cnt == 0 {
+		cnt = f.dict.writeCopy(f.copyDist, f.copyLen)
+	}
+	f.copyLen -= cnt
+	if f.dict.availWrite() != 0 && f.copyLen == 0 {
+		return false
+	}
+	f.toRead = f.dict.readFlush()
+	f.step = (*decompressor).huffmanBlock // We need to continue this work
+	f.stepState = stateDict
+	return true
 }
 
 // Copy a single uncompressed data block from input to output.
@@ -784,7 +897,9 @@ func fixedHuffmanDecoderInit() {
 }
 
 func (f *decompressor) Reset(r io.Reader, dict []byte) error {
+	mode := f.mode
 	*f = decompressor{
+		mode:     mode,
 		rBuf:     f.rBuf,
 		bits:     f.bits,
 		codebits: f.codebits,
@@ -792,7 +907,7 @@ func (f *decompressor) Reset(r io.Reader, dict []byte) error {
 		step:     (*decompressor).nextBlock,
 	}
 	f.makeReader(r)
-	f.dict.init(maxMatchOffset, dict)
+	f.dict.init(f.historyWindowSize(), dict)
 	return nil
 }
 
@@ -808,11 +923,36 @@ func NewReader(r io.Reader) io.ReadCloser {
 	fixedHuffmanDecoderInit()
 
 	var f decompressor
+	f.mode = decoderModeDeflate
 	f.makeReader(r)
-	f.bits = new([maxNumLit + maxNumDist]int)
+	f.bits = new([maxNumLit + maxNumDistDeflate64]int)
 	f.codebits = new([numCodes]int)
 	f.step = (*decompressor).nextBlock
-	f.dict.init(maxMatchOffset, nil)
+	f.dict.init(f.historyWindowSize(), nil)
+	return &f
+}
+
+// NewReader64 returns a new ReadCloser that can be used to read the
+// uncompressed version of a raw Deflate64 stream from r.
+// It does not decode zlib, gzip, or ZIP framing around the raw Deflate64 data.
+// If r does not also implement [io.ByteReader],
+// the decompressor may read more data than necessary from r.
+// The reader returns [io.EOF] after the final block in the Deflate64 stream has
+// been encountered. Any trailing data after the final block is ignored.
+//
+// The [io.ReadCloser] returned by NewReader64 also implements [Resetter].
+func NewReader64(r io.Reader) io.ReadCloser {
+	fixedHuffmanDecoderInit()
+
+	var f decompressor
+
+	f.mode = decoderModeDeflate64
+	f.makeReader(r)
+	f.bits = new([maxNumLit + maxNumDistDeflate64]int)
+	f.codebits = new([numCodes]int)
+	f.step = (*decompressor).nextBlock
+	f.dict.init(f.historyWindowSize(), nil)
+
 	return &f
 }
 
@@ -827,10 +967,11 @@ func NewReaderDict(r io.Reader, dict []byte) io.ReadCloser {
 	fixedHuffmanDecoderInit()
 
 	var f decompressor
+	f.mode = decoderModeDeflate
 	f.makeReader(r)
-	f.bits = new([maxNumLit + maxNumDist]int)
+	f.bits = new([maxNumLit + maxNumDistDeflate64]int)
 	f.codebits = new([numCodes]int)
 	f.step = (*decompressor).nextBlock
-	f.dict.init(maxMatchOffset, dict)
+	f.dict.init(f.historyWindowSize(), dict)
 	return &f
 }
