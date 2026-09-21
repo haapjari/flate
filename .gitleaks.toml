@@ -1,0 +1,7 @@
+# gitleaks configuration.
+#
+# The default ruleset is used as is. Add allowlist entries only for exact
+# example strings that actually triggered a finding, never for whole paths.
+
+[extend]
+useDefault = true

@@ -5,44 +5,15 @@ set -o nounset
 set -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-HOOKS_DIR="${REPO_ROOT}/.git/hooks"
+
+cd "${REPO_ROOT}"
 
 echo "setting up git hooks..."
 
-cat > "${HOOKS_DIR}/pre-commit" << 'EOF'
-#!/usr/bin/env bash
-
-# pre-commit hook for this template
-# runs formatting, lint, and tests before allowing a commit.
-
-set -o errexit
-set -o nounset
-set -o pipefail
-
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-
-echo "running pre-commit checks..."
-echo ""
-
-if ! make verify test-race; then
-    echo "=========================================="
-    echo "pre-commit FAILED"
-    echo "=========================================="
-    echo ""
-    echo "fix the issues above or use 'git commit --no-verify' to skip."
-    exit 1
-fi
-
-echo "=========================================="
-echo "pre-commit PASSED"
-echo "=========================================="
-EOF
-
-chmod +x "${HOOKS_DIR}/pre-commit"
+git config core.hooksPath .githooks
 
 echo "git hooks installed successfully!"
 echo ""
-echo "installed hooks:"
-echo "  - pre-commit: runs formatting, lint, and race tests"
-echo ""
-echo "to skip hooks temporarily: git commit --no-verify"
+echo "installed hooks (core.hooksPath=.githooks):"
+echo "  - pre-commit: scans staged changes for secrets with gitleaks"
+echo "  - pre-push: refuses direct pushes to main"

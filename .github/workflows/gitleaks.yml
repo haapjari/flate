@@ -1,0 +1,29 @@
+name: gitleaks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@latest
+
+      - name: scan history and working tree
+        run: hack/verify-gitleaks.sh
