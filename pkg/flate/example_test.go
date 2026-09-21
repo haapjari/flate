@@ -6,13 +6,14 @@ package flate_test
 
 import (
 	"bytes"
-	"compress/flate"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/haapjari/flate/pkg/flate"
 )
 
 // In performance critical applications, Reset can be used to discard the
