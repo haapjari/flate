@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+# pre-commit hook: scans staged changes for secrets with gitleaks.
+# enable with 'make setup-hooks' (git config core.hooksPath .githooks).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+if ! command -v gitleaks > /dev/null 2>&1; then
+    echo "ERROR: gitleaks is not installed, refusing to commit" >&2
+    echo "" >&2
+    echo "Run 'go install github.com/zricethezav/gitleaks/v8@latest' to install it." >&2
+    exit 1
+fi
+
+gitleaks git --pre-commit --staged --no-banner --redact

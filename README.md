@@ -27,6 +27,25 @@ For ZIP files using method 9, it can be registered with `archive/zip`:
 zipReader.RegisterDecompressor(9, flate.NewReader64)
 ```
 
+## Secret scanning
+
+This repository is scanned with [gitleaks](https://github.com/gitleaks/gitleaks)
+using the default ruleset in [`.gitleaks.toml`](.gitleaks.toml).
+
+```sh
+go install github.com/zricethezav/gitleaks/v8@latest
+make setup-hooks
+```
+
+`make setup-hooks` enables the versioned hooks in `.githooks`. The pre-commit
+hook scans staged changes and fails when gitleaks is not installed. The pre-push
+hook refuses direct pushes to `main`.
+
+`make verify-gitleaks` scans the full git history and the working tree. It is
+part of `make verify` and also runs in CI.
+
+The `main` branch is protected. Changes go through a pull request.
+
 ## License
 
 This repository is derived from Go's standard library.

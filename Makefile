@@ -66,6 +66,7 @@ help:
 	@echo "  verify-vet       - run go vet"
 	@echo "  verify-lint      - skip golangci-lint placeholder"
 	@echo "  verify-govulncheck - run govulncheck (optional)"
+	@echo "  verify-gitleaks  - scan git history and working tree for secrets"
 	@echo ""
 	@echo "Update:"
 	@echo "  update           - run update-gofmt and update-gomod"
@@ -74,7 +75,7 @@ help:
 	@echo ""
 	@echo "Development:"
 	@echo "  tools            - install development tools"
-	@echo "  setup-hooks      - install git pre-commit hook"
+	@echo "  setup-hooks      - enable versioned git hooks from .githooks"
 	@echo ""
 	@echo "Variables:"
 	@echo "  DBG_MAKEFILE=1   - show make debugging output"
@@ -145,6 +146,7 @@ verify: verify-go-version \
 	test-cover \
 	test-race-cover-changed \
 	verify-govulncheck \
+	verify-gitleaks \
 	lint-complexity-changed
 	@echo "all verification checks passed!"
 
@@ -167,6 +169,10 @@ verify-vet:
 .PHONY: verify-govulncheck
 verify-govulncheck: $(TOOLS_DIR)/govulncheck
 	$(TOOLS_DIR)/govulncheck ./...
+
+.PHONY: verify-gitleaks
+verify-gitleaks:
+	@$(HACK_DIR)/verify-gitleaks.sh
 
 .PHONY: verify-lint
 verify-lint:
